@@ -77,3 +77,39 @@ output "webhook_uri" {
 output "fslogix_logic_app_name" {
   value = module.fslogix_automation.logic_app_name
 }
+
+output "fslogix_archive_container" {
+  value = module.fslogix_storage.archive_container_name
+}
+
+# =============================================================================
+# Phase 3 - Orphaned Profile Cleanup
+# =============================================================================
+output "orphan_cleanup_runbook_name" {
+  value = module.fslogix_automation.orphan_cleanup_runbook_name
+}
+
+output "orphan_cleanup_logic_app_name" {
+  value = module.fslogix_automation.orphan_cleanup_logic_app_name
+}
+
+output "orphan_cleanup_webhook_uri" {
+  value     = module.fslogix_automation.orphan_cleanup_webhook_uri
+  sensitive = true
+}
+
+# =============================================================================
+# Phase 4 - Stale Handle Cleanup
+# =============================================================================
+output "stale_handle_runbook_name" {
+  value = module.fslogix_automation.stale_handle_runbook_name
+}
+
+output "stale_handle_logic_app_name" {
+  value = module.fslogix_automation.stale_handle_logic_app_name
+}
+
+output "stale_handle_webhook_uri" {
+  value     = module.fslogix_automation.stale_handle_webhook_uri
+  sensitive = true
+}

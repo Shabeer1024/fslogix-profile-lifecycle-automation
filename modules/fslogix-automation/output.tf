@@ -35,3 +35,29 @@ output "logic_app_name" {
 output "logic_app_id" {
   value = azurerm_logic_app_workflow.fslogix_scheduler.id
 }
+
+output "orphan_cleanup_runbook_name" {
+  value = azurerm_automation_runbook.orphan_cleanup.name
+}
+
+output "orphan_cleanup_webhook_uri" {
+  value     = azurerm_automation_webhook.orphan_cleanup_trigger.uri
+  sensitive = true
+}
+
+output "orphan_cleanup_logic_app_name" {
+  value = azurerm_logic_app_workflow.orphan_scheduler.name
+}
+
+output "stale_handle_runbook_name" {
+  value = azurerm_automation_runbook.stale_handle.name
+}
+
+output "stale_handle_webhook_uri" {
+  value     = azurerm_automation_webhook.stale_handle_trigger.uri
+  sensitive = true
+}
+
+output "stale_handle_logic_app_name" {
+  value = azurerm_logic_app_workflow.stale_handle_scheduler.name
+}

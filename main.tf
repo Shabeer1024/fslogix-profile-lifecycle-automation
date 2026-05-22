@@ -136,5 +136,15 @@ module "fslogix_automation" {
   session_host_vm_name = module.session_host.vm_name
   tags                 = var.tags
 
+  storage_account_name   = module.fslogix_storage.storage_account_name
+  storage_account_key    = module.fslogix_storage.primary_access_key
+  share_name             = module.fslogix_storage.share_name
+  archive_container_name = module.fslogix_storage.archive_container_name
+
+  teams_webhook_url   = var.teams_webhook_url
+  orphan_archive_days = var.orphan_archive_days
+  orphan_delete_days  = var.orphan_delete_days
+  stale_handle_hours  = var.stale_handle_hours
+
   depends_on = [module.fslogix_storage]
 }

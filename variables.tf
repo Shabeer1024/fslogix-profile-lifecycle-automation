@@ -109,3 +109,31 @@ variable "fslogix_initial_size_mb" {
   type    = number
   default = 10240
 }
+
+# =============================================================================
+# Lifecycle automation
+# =============================================================================
+variable "teams_webhook_url" {
+  description = "Teams Incoming Webhook URL for runbook notifications. Leave empty to disable."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "orphan_archive_days" {
+  description = "Days after last activity before an orphaned profile is archived to blob (Cool tier)"
+  type        = number
+  default     = 90
+}
+
+variable "orphan_delete_days" {
+  description = "Days after last activity before an orphaned profile is permanently deleted"
+  type        = number
+  default     = 180
+}
+
+variable "stale_handle_hours" {
+  description = "Hours an SMB handle must be held before it is eligible for forced closure"
+  type        = number
+  default     = 2
+}

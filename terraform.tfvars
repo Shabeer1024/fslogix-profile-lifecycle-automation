@@ -30,4 +30,10 @@ auto_shutdown_time     = "2300"
 auto_shutdown_timezone = "India Standard Time"
 
 
-fslogix_storage_account_name = "stfslogixshabeer042"  
+fslogix_storage_account_name = "stfslogixshabeer042"
+
+# Lifecycle automation — set teams_webhook_url to enable Teams notifications
+# teams_webhook_url   = "https://outlook.office.com/webhook/..."
+orphan_archive_days = 90
+orphan_delete_days  = 180
+stale_handle_hours  = 2

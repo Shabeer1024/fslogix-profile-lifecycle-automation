@@ -27,6 +27,12 @@ locals {
   })
 }
 
+resource "azurerm_storage_container" "archive" {
+  name                  = "archive-profiles"
+  storage_account_id    = azurerm_storage_account.this.id
+  container_access_type = "private"
+}
+
 resource "azurerm_virtual_machine_extension" "install_fslogix" {
   name                       = "install-fslogix"
   virtual_machine_id         = var.session_host_vm_id
