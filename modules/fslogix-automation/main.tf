@@ -40,7 +40,7 @@ resource "azurerm_virtual_machine_run_command" "install_hyperv" {
   virtual_machine_id = var.session_host_vm_id
   location           = var.location
 
- source {
+  source {
     script = <<-EOT
       $ErrorActionPreference = "Stop"
       try {
@@ -54,6 +54,13 @@ resource "azurerm_virtual_machine_run_command" "install_hyperv" {
           exit 1
       }
     EOT
+  }
+
+  # Run commands are one-shot setup operations. After the VM shuts down, Azure
+  # times out on the instanceView GET during terraform plan. ignore_changes = all
+  # tells Terraform to never re-read or re-run this resource after initial creation.
+  lifecycle {
+    ignore_changes = all
   }
 }
 
@@ -110,6 +117,10 @@ resource "azurerm_virtual_machine_run_command" "install_az_storage" {
     azurerm_virtual_machine_extension.hybrid_worker,
     azurerm_virtual_machine_run_command.install_hyperv
   ]
+
+  lifecycle {
+    ignore_changes = all
+  }
 }
 
 # =============================================================================
@@ -149,6 +160,8 @@ resource "azurerm_automation_variable_string" "archive_container" {
 }
 
 resource "azurerm_automation_variable_string" "teams_webhook" {
+  # Only created when a URL is actually provided — AzureRM rejects empty string values
+  count                   = var.teams_webhook_url != "" ? 1 : 0
   name                    = "FslogixTeamsWebhook"
   resource_group_name     = var.resource_group_name
   automation_account_name = azurerm_automation_account.this.name

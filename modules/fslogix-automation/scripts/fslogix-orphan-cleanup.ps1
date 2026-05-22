@@ -27,7 +27,7 @@ $StorageAccountName = Get-AutomationVariable -Name "FslogixStorageAccount"
 $StorageAccountKey  = Get-AutomationVariable -Name "FslogixStorageKey"
 $ShareName          = Get-AutomationVariable -Name "FslogixShareName"
 $ArchiveContainer   = Get-AutomationVariable -Name "FslogixArchiveContainer"
-$TeamsWebhookUrl    = Get-AutomationVariable -Name "FslogixTeamsWebhook"
+$TeamsWebhookUrl    = try { Get-AutomationVariable -Name "FslogixTeamsWebhook" -ErrorAction Stop } catch { "" }
 $SharePath          = "\\$StorageAccountName.file.core.windows.net\$ShareName"
 
 $result = @{

@@ -92,7 +92,11 @@ jobs:
       # ── Plan ────────────────────────────────────────────────────────────────
       - name: Terraform Plan
         id: plan
-        run: terraform plan -no-color -input=false
+        # -refresh=false skips reading live Azure state for resources that error when
+        # VMs are stopped (azurerm_virtual_machine_run_command instanceView timeout).
+        # State is authoritative via Terraform Cloud; drift detection still works for
+        # all other resource types.
+        run: terraform plan -no-color -input=false -refresh=false
         env:
           TF_VAR_admin_source_ip: ${{ secrets.ADMIN_SOURCE_IP }}
         continue-on-error: true  # capture output even on failure

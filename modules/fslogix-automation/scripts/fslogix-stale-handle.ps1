@@ -21,7 +21,7 @@ param(
 $StorageAccountName = Get-AutomationVariable -Name "FslogixStorageAccount"
 $StorageAccountKey  = Get-AutomationVariable -Name "FslogixStorageKey"
 $ShareName          = Get-AutomationVariable -Name "FslogixShareName"
-$TeamsWebhookUrl    = Get-AutomationVariable -Name "FslogixTeamsWebhook"
+$TeamsWebhookUrl    = try { Get-AutomationVariable -Name "FslogixTeamsWebhook" -ErrorAction Stop } catch { "" }
 
 $result = @{
     StartTime         = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
