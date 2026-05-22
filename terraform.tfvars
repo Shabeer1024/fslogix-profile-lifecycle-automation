@@ -18,7 +18,7 @@ subnets = {
 nsg_name        = "nsg-avd-lab"
 
 
-
+admin_source_ip = "49.206.131.209"
 
 
 dc_vm_name             = "dc01"
