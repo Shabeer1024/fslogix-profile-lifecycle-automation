@@ -1,0 +1,142 @@
+# ============================================================
+# GitHub Actions — FSLogix Orphan Profile Cleanup
+# Schedule: every Sunday at 02:00 UTC
+#
+# What it does:
+#   1. Lists all VHDX folders on the FSLogix file share
+#   2. Extracts SID from folder name (username_S-1-5-21-...)
+#   3. Cross-references SID against Entra ID (Azure AD)
+#   4. Orphaned + >90 days  → archives to cool-tier storage
+#   5. Orphaned + >180 days → deletes with audit log
+#   6. Posts summary to Teams and uploads audit CSV artifact
+#
+# Required secrets (in addition to existing migration secrets):
+#   ARCHIVE_STORAGE_ACCOUNT  — storage account for cool-tier archive
+#   ARCHIVE_STORAGE_KEY      — key for the archive storage account
+#   ARCHIVE_SHARE_NAME       — file share name (default: fslogix-archive)
+#   TEAMS_WEBHOOK_URL        — incoming webhook URL for Teams alerts
+#
+# Required permission on the service principal:
+#   Microsoft Graph → User.Read.All  (for SID → Entra ID lookup)
+# ============================================================
+
+name: FSLogix Orphan Profile Cleanup
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'   # Every Sunday at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — scan only, no changes made'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      archive_after_days:
+        description: 'Archive orphaned profiles older than N days'
+        required: false
+        default: '90'
+      delete_after_days:
+        description: 'Delete orphaned profiles older than N days'
+        required: false
+        default: '180'
+
+env:
+  ARM_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET:   ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+
+  # ── Orphan Detection + Archive / Delete ──────────────────
+  orphan-cleanup:
+    name: 'Orphan Profile Cleanup'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install AzCopy
+        shell: pwsh
+        run: |
+          Write-Host "Installing AzCopy..."
+          Invoke-WebRequest -Uri "https://aka.ms/downloadazcopy-v10-windows" -OutFile "azcopy.zip"
+          Expand-Archive -Path "azcopy.zip" -DestinationPath "azcopy_folder"
+          $exe = Get-ChildItem -Path "azcopy_folder" -Recurse -Filter "azcopy.exe" | Select-Object -First 1
+          Copy-Item $exe.FullName -Destination "C:\azcopy.exe"
+          Write-Host "AzCopy installed at C:\azcopy.exe"
+
+      - name: Run Orphan Profile Cleanup
+        id: cleanup
+        shell: pwsh
+        run: |
+          # Resolve inputs — workflow_dispatch sets these; schedule trigger does not
+          $dryRun      = "${{ github.event.inputs.dry_run }}"
+          $archiveDays = "${{ github.event.inputs.archive_after_days }}"
+          $deleteDays  = "${{ github.event.inputs.delete_after_days }}"
+
+          # Defaults for scheduled (cron) runs
+          if (-not $dryRun)      { $dryRun      = "false" }
+          if (-not $archiveDays) { $archiveDays  = "90"   }
+          if (-not $deleteDays)  { $deleteDays   = "180"  }
+
+          $params = @{
+            StorageAccount        = "${{ secrets.SOURCE_STORAGE_ACCOUNT }}"
+            StorageKey            = "${{ secrets.SOURCE_STORAGE_KEY }}"
+            ShareName             = "${{ secrets.SOURCE_SHARE_NAME }}"
+            ArchiveStorageAccount = "${{ secrets.ARCHIVE_STORAGE_ACCOUNT }}"
+            ArchiveStorageKey     = "${{ secrets.ARCHIVE_STORAGE_KEY }}"
+            ArchiveShareName      = "${{ secrets.ARCHIVE_SHARE_NAME }}"
+            TeamsWebhookUrl       = "${{ secrets.TEAMS_WEBHOOK_URL }}"
+            ArchiveAfterDays      = [int]$archiveDays
+            DeleteAfterDays       = [int]$deleteDays
+          }
+
+          if ($dryRun -eq "true") {
+            .\scripts\orphan-profile-cleanup.ps1 @params -DryRun
+          } else {
+            .\scripts\orphan-profile-cleanup.ps1 @params
+          }
+
+      - name: Upload Audit Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orphan-audit-${{ github.run_number }}
+          path: orphan-cleanup-audit-*.csv
+          retention-days: 365   # keep audit trail for 1 year
+
+      - name: Job Summary
+        if: always()
+        shell: pwsh
+        run: |
+          $dryRun = "${{ github.event.inputs.dry_run }}"
+          if (-not $dryRun) { $dryRun = "false" }
+          $modeLabel = if ($dryRun -eq "true") { "Dry Run" } else { "Live Run" }
+
+          $archiveDays = "${{ github.event.inputs.archive_after_days }}"
+          $deleteDays  = "${{ github.event.inputs.delete_after_days }}"
+          if (-not $archiveDays) { $archiveDays = "90"  }
+          if (-not $deleteDays)  { $deleteDays  = "180" }
+
+          echo "## FSLogix Orphan Profile Cleanup — $modeLabel" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Setting | Value |" >> $env:GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Share scanned      | ${{ secrets.SOURCE_STORAGE_ACCOUNT }}/${{ secrets.SOURCE_SHARE_NAME }} |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Archive threshold  | $archiveDays days |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Delete threshold   | $deleteDays days |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Archive target     | ${{ secrets.ARCHIVE_STORAGE_ACCOUNT }}/${{ secrets.ARCHIVE_SHARE_NAME }} |" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "> Full audit CSV attached as artifact (retained 365 days)." >> $env:GITHUB_STEP_SUMMARY
+          echo "> Teams notification sent to configured webhook." >> $env:GITHUB_STEP_SUMMARY

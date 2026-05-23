@@ -1,0 +1,336 @@
+# ============================================================
+# GitHub Actions — FSLogix Profile Migration Pipeline
+# Steps:
+#   1. Terraform → provision target storage
+#   2. AzCopy    → migrate profile data
+#   3. Verify    → check data integrity
+#   4. Update    → FSLogix path in AVD
+# ============================================================
+
+name: FSLogix Profile Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'lab'
+        type: choice
+        options:
+          - lab
+          - non-prod
+          - prod
+
+      dry_run:
+        description: 'Dry run only (no actual copy)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+      terraform_action:
+        description: 'Terraform action'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+env:
+  TF_VERSION: '1.7.0'
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+
+  # ── JOB 1: Provision Target Storage ──────────────────────
+  terraform-provision:
+    name: '1. Provision Target Storage'
+    runs-on: ubuntu-latest
+    outputs:
+      target_storage_name: ${{ steps.tf-output.outputs.target_storage_name }}
+      target_share_name: ${{ steps.tf-output.outputs.target_share_name }}
+      target_file_share_url: ${{ steps.tf-output.outputs.target_file_share_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=fslogix-migration.tfstate"
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -out=main.tfplan
+        
+      - name: Terraform Apply
+        if: github.event.inputs.terraform_action == 'apply'
+        working-directory: terraform
+        run: terraform apply main.tfplan
+
+      - name: Get Terraform Outputs
+        id: tf-output
+        if: github.event.inputs.terraform_action == 'apply'
+        working-directory: terraform
+        run: |
+          echo "target_storage_name=$(terraform output -raw target_storage_account_name)" >> $GITHUB_OUTPUT
+          echo "target_share_name=$(terraform output -raw target_file_share_name)" >> $GITHUB_OUTPUT
+          echo "target_file_share_url=$(terraform output -raw target_file_share_url)" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          echo "## ✅ Terraform Complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Storage | ${{ steps.tf-output.outputs.target_storage_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| File Share | ${{ steps.tf-output.outputs.target_share_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| UNC Path | ${{ steps.tf-output.outputs.target_file_share_url }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ── JOB 2: Migrate Data with AzCopy ──────────────────────
+  azcopy-migration:
+    name: '2. Migrate Profile Data'
+    runs-on: windows-latest
+    needs: terraform-provision
+    if: github.event.inputs.terraform_action == 'apply'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install AzCopy
+        shell: pwsh
+        run: |
+          Write-Host "Installing AzCopy..."
+          Invoke-WebRequest -Uri "https://aka.ms/downloadazcopy-v10-windows" -OutFile "azcopy.zip"
+          Expand-Archive -Path "azcopy.zip" -DestinationPath "azcopy_folder"
+          $azcopyPath = Get-ChildItem -Path "azcopy_folder" -Recurse -Filter "azcopy.exe" | Select-Object -First 1
+          Copy-Item $azcopyPath.FullName -Destination "C:\azcopy.exe"
+          Write-Host "AzCopy installed at C:\azcopy.exe"
+
+      - name: Get Source Storage SAS Token
+        id: source-sas
+        shell: pwsh
+        run: |
+          $expiry = (Get-Date).AddHours(4).ToString("yyyy-MM-ddTHH:mm:ssZ")
+          
+          $sourceSas = az storage share generate-sas `
+            --account-name "${{ secrets.SOURCE_STORAGE_ACCOUNT }}" `
+            --account-key "${{ secrets.SOURCE_STORAGE_KEY }}" `
+            --name "${{ secrets.SOURCE_SHARE_NAME }}" `
+            --permissions "rl" `
+            --expiry $expiry `
+            --output tsv
+          
+          echo "SOURCE_SAS=$sourceSas" >> $env:GITHUB_ENV
+          Write-Host "Source SAS token generated"
+
+      - name: Get Target Storage SAS Token
+        id: target-sas
+        shell: pwsh
+        run: |
+          $expiry = (Get-Date).AddHours(4).ToString("yyyy-MM-ddTHH:mm:ssZ")
+          
+          $targetSas = az storage share generate-sas `
+            --account-name "${{ needs.terraform-provision.outputs.target_storage_name }}" `
+            --account-key "${{ secrets.TARGET_STORAGE_KEY }}" `
+            --name "${{ needs.terraform-provision.outputs.target_share_name }}" `
+            --permissions "rwdl" `
+            --expiry $expiry `
+            --output tsv
+          
+          echo "TARGET_SAS=$targetSas" >> $env:GITHUB_ENV
+          Write-Host "Target SAS token generated"
+
+      - name: Dry Run — Preview Migration
+        shell: pwsh
+        run: |
+          $sourceUrl = "https://${{ secrets.SOURCE_STORAGE_ACCOUNT }}.file.core.windows.net/${{ secrets.SOURCE_SHARE_NAME }}?$env:SOURCE_SAS"
+          $targetUrl = "https://${{ needs.terraform-provision.outputs.target_storage_name }}.file.core.windows.net/${{ needs.terraform-provision.outputs.target_share_name }}?$env:TARGET_SAS"
+          
+          Write-Host "=== DRY RUN — Preview only ===" -ForegroundColor Cyan
+          
+          C:\azcopy.exe copy $sourceUrl $targetUrl `
+            --recursive `
+            --dry-run `
+            --log-level=INFO
+          
+          Write-Host "Dry run complete — review above output"
+
+      - name: Run AzCopy Migration
+        if: github.event.inputs.dry_run == 'false'
+        shell: pwsh
+        run: |
+          $sourceUrl = "https://${{ secrets.SOURCE_STORAGE_ACCOUNT }}.file.core.windows.net/${{ secrets.SOURCE_SHARE_NAME }}?$env:SOURCE_SAS"
+          $targetUrl = "https://${{ needs.terraform-provision.outputs.target_storage_name }}.file.core.windows.net/${{ needs.terraform-provision.outputs.target_share_name }}?$env:TARGET_SAS"
+          
+          Write-Host "=== Starting AzCopy Migration ===" -ForegroundColor Green
+          Write-Host "Source: ${{ secrets.SOURCE_STORAGE_ACCOUNT }}/${{ secrets.SOURCE_SHARE_NAME }}"
+          Write-Host "Target: ${{ needs.terraform-provision.outputs.target_storage_name }}/${{ needs.terraform-provision.outputs.target_share_name }}"
+          
+          # Run AzCopy with full logging
+          C:\azcopy.exe copy $sourceUrl $targetUrl `
+            --recursive `
+            --preserve-smb-info `
+            --preserve-smb-permissions `
+            --check-length `
+            --check-md5=FailIfDifferent `
+            --log-level=WARNING `
+            --output-type=json | Tee-Object -FilePath "azcopy-log.json"
+          
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "AzCopy failed with exit code $LASTEXITCODE" -ForegroundColor Red
+            exit 1
+          }
+          
+          Write-Host "Migration complete!" -ForegroundColor Green
+
+      - name: Upload AzCopy Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azcopy-logs
+          path: azcopy-log.json
+          retention-days: 30
+
+  # ── JOB 3: Verify Migration ───────────────────────────────
+  verify-migration:
+    name: '3. Verify Migration'
+    runs-on: windows-latest
+    needs: [terraform-provision, azcopy-migration]
+    if: github.event.inputs.dry_run == 'false'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Verify File Count and Size
+        shell: pwsh
+        run: |
+          Write-Host "=== Verifying Migration ===" -ForegroundColor Cyan
+
+          # Source stats
+          $sourceFiles = az storage file list `
+            --account-name "${{ secrets.SOURCE_STORAGE_ACCOUNT }}" `
+            --account-key "${{ secrets.SOURCE_STORAGE_KEY }}" `
+            --share-name "${{ secrets.SOURCE_SHARE_NAME }}" `
+            --recursive `
+            --query "length(@)" `
+            --output tsv
+
+          # Target stats
+          $targetFiles = az storage file list `
+            --account-name "${{ needs.terraform-provision.outputs.target_storage_name }}" `
+            --account-key "${{ secrets.TARGET_STORAGE_KEY }}" `
+            --share-name "${{ needs.terraform-provision.outputs.target_share_name }}" `
+            --recursive `
+            --query "length(@)" `
+            --output tsv
+
+          Write-Host "Source file count: $sourceFiles"
+          Write-Host "Target file count: $targetFiles"
+
+          if ($sourceFiles -ne $targetFiles) {
+            Write-Host "WARNING: File count mismatch!" -ForegroundColor Yellow
+            Write-Host "Source: $sourceFiles | Target: $targetFiles"
+            exit 1
+          }
+
+          Write-Host "File count matches!" -ForegroundColor Green
+
+      - name: Run Verification Script
+        shell: pwsh
+        run: |
+          .\scripts\verify-migration.ps1 `
+            -SourceStorageAccount "${{ secrets.SOURCE_STORAGE_ACCOUNT }}" `
+            -SourceStorageKey "${{ secrets.SOURCE_STORAGE_KEY }}" `
+            -SourceShareName "${{ secrets.SOURCE_SHARE_NAME }}" `
+            -TargetStorageAccount "${{ needs.terraform-provision.outputs.target_storage_name }}" `
+            -TargetStorageKey "${{ secrets.TARGET_STORAGE_KEY }}" `
+            -TargetShareName "${{ needs.terraform-provision.outputs.target_share_name }}"
+
+      - name: Verification Summary
+        shell: pwsh
+        run: |
+          echo "## ✅ Verification Complete" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $env:GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          echo "| File count match | ✅ Pass |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| VHD files present | ✅ Pass |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| File size match | ✅ Pass |" >> $env:GITHUB_STEP_SUMMARY
+
+  # ── JOB 4: Update FSLogix Path ────────────────────────────
+  update-fslogix-path:
+    name: '4. Update FSLogix Path in AVD'
+    runs-on: windows-latest
+    needs: [terraform-provision, verify-migration]
+    if: github.event.inputs.dry_run == 'false'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update FSLogix Registry on Session Hosts
+        shell: pwsh
+        run: |
+          .\scripts\update-fslogix-path.ps1 `
+            -ResourceGroup "${{ secrets.AVD_RESOURCE_GROUP }}" `
+            -HostPoolName "${{ secrets.AVD_HOST_POOL_NAME }}" `
+            -NewProfilePath "${{ needs.terraform-provision.outputs.target_file_share_url }}"
+
+      - name: Final Pipeline Summary
+        shell: pwsh
+        run: |
+          echo "# 🎉 FSLogix Migration Complete" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "## Migration Details" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $env:GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Target storage provisioned | ✅ Done |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Profile data migrated | ✅ Done |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| Data verified | ✅ Done |" >> $env:GITHUB_STEP_SUMMARY
+          echo "| FSLogix path updated | ✅ Done |" >> $env:GITHUB_STEP_SUMMARY
+          echo "" >> $env:GITHUB_STEP_SUMMARY
+          echo "## New FSLogix Path" >> $env:GITHUB_STEP_SUMMARY
+          echo "\`${{ needs.terraform-provision.outputs.target_file_share_url }}\`" >> $env:GITHUB_STEP_SUMMARY
