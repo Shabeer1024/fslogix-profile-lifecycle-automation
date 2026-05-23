@@ -1,0 +1,51 @@
+$ErrorActionPreference = "Stop"
+Start-Transcript "C:\Windows\Temp\install-fslogix.log" -Append -Force
+
+try {
+    Write-Host "[$(Get-Date -Format HH:mm:ss)] Starting FSLogix install"
+
+    if (Test-Path "C:\Program Files\FSLogix\Apps\frx.exe") {
+        Write-Host "FSLogix already installed, skipping download"
+    } else {
+        $url = "https://aka.ms/fslogix_download"
+        $zip = "C:\Windows\Temp\fslogix.zip"
+        $dst = "C:\Windows\Temp\fslogix"
+
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        Expand-Archive -Path $zip -DestinationPath $dst -Force
+
+        $installer = Get-ChildItem $dst -Recurse -Filter "FSLogixAppsSetup.exe" |
+                     Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+        if (-not $installer) { throw "FSLogix installer not found" }
+
+        Start-Process -FilePath $installer.FullName -ArgumentList "/install","/quiet","/norestart" -Wait
+        Write-Host "FSLogix installed"
+    }
+
+    $keyBytes = [Convert]::FromBase64String("${storage_key_b64}")
+    $key      = [Text.Encoding]::UTF8.GetString($keyBytes)
+    $target   = "${storage_account}.file.core.windows.net"
+    cmdkey /add:$target /user:"Azure\${storage_account}" /pass:$key | Out-Null
+    Write-Host "SMB credentials stored"
+
+    $regBase = "HKLM:\SOFTWARE\FSLogix\Profiles"
+    if (-not (Test-Path $regBase)) { New-Item -Path $regBase -Force | Out-Null }
+
+    Set-ItemProperty -Path $regBase -Name "Enabled"                              -Value 1                  -Type DWord
+    Set-ItemProperty -Path $regBase -Name "VHDLocations"                         -Value "${share_path}"    -Type MultiString
+    Set-ItemProperty -Path $regBase -Name "SizeInMBs"                            -Value ${size_in_mbs}     -Type DWord
+    Set-ItemProperty -Path $regBase -Name "IsDynamic"                            -Value 1                  -Type DWord
+    Set-ItemProperty -Path $regBase -Name "VolumeType"                           -Value "VHDX"             -Type String
+    Set-ItemProperty -Path $regBase -Name "FlipFlopProfileDirectoryName"         -Value 1                  -Type DWord
+    Set-ItemProperty -Path $regBase -Name "DeleteLocalProfileWhenVHDShouldApply" -Value 1                  -Type DWord
+    Set-ItemProperty -Path $regBase -Name "AccessNetworkAsComputerObject"       -Value 1                  -Type DWord
+
+    Write-Host "[$(Get-Date -Format HH:mm:ss)] FSLogix setup complete"
+    Stop-Transcript
+    exit 0
+}
+catch {
+    Write-Error "FSLogix setup failed: $_"
+    Stop-Transcript
+    exit 1
+}
