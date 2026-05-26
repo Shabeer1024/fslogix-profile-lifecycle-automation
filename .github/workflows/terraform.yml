@@ -1,4 +1,17 @@
-name: Terraform
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FSLogix Profile Lifecycle Automation — CI/CD
+#
+# Required GitHub Secrets:
+#   TF_API_TOKEN          HCP Terraform API token (org: d2click)
+#   AZURE_CLIENT_ID       Service-principal App ID  (OIDC, no secret needed)
+#   AZURE_TENANT_ID       Azure tenant ID
+#   AZURE_SUBSCRIPTION_ID Azure subscription ID
+#   ADMIN_SOURCE_IP       Your public IP/CIDR for the RDP allow rule
+#
+# Required GitHub Environment:
+#   production            Enable "Required reviewers" for apply/destroy gates
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+name: "FSLogix CI/CD"
 
 on:
   push:
@@ -6,42 +19,52 @@ on:
     paths-ignore:
       - "**.md"
       - "Screenshots/**"
+      - ".github/pull_request_template.md"
   pull_request:
     branches: [main]
     paths-ignore:
       - "**.md"
       - "Screenshots/**"
+      - ".github/pull_request_template.md"
   workflow_dispatch:
     inputs:
       destroy:
-        description: "Type DESTROY to run terraform destroy"
+        description: "Type DESTROY to run terraform destroy (IRREVERSIBLE)"
         required: false
         default: ""
 
+# Least-privilege permissions
 permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
+  id-token: write        # Azure OIDC token exchange
+  contents: read         # Checkout
+  pull-requests: write   # Post/update plan comment on PRs
+  security-events: write # Upload SARIF to GitHub Security tab
 
 env:
   TF_VERSION: "1.9.5"
-  TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+  TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}  # HCP Terraform auth
   ARM_USE_OIDC: "true"
   ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
   ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+# One active run per ref — cancel in-progress when a new commit is pushed
 concurrency:
-  group: terraform-${{ github.ref }}
+  group: "terraform-${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 jobs:
-  # ============================================================================
-  # JOB 1 - Lint, Validate, Plan
-  # ============================================================================
-  plan:
-    name: "Lint - Validate - Plan"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Format + Validate (fast gate, runs on every push/PR)
+  # ──────────────────────────────────────────────────────────────────────────
+  validate:
+    name: "Validate"
     runs-on: ubuntu-latest
+    outputs:
+      fmt_outcome:      ${{ steps.fmt.outcome }}
+      validate_outcome: ${{ steps.validate.outcome }}
 
     steps:
       - name: Checkout
@@ -51,8 +74,20 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: true
+          terraform_wrapper: false          # no output capture needed here
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Cache provider plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('.terraform.lock.hcl') }}
+          restore-keys: tf-plugins-${{ runner.os }}-
+
+      - name: Configure plugin cache dir
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          echo "plugin_cache_dir = \"$HOME/.terraform.d/plugin-cache\"" >> "$HOME/.terraformrc"
 
       - name: Terraform Format Check
         id: fmt
@@ -60,111 +95,319 @@ jobs:
         continue-on-error: true
 
       - name: Terraform Init
-        id: init
         run: terraform init -input=false
 
       - name: Terraform Validate
         id: validate
         run: terraform validate -no-color
 
+      - name: Write Job Summary
+        if: always()
+        run: |
+          FMT="${{ steps.fmt.outcome }}"
+          VAL="${{ steps.validate.outcome }}"
+          [ "$FMT" = "success" ] && FMT_ICON="✅" || FMT_ICON="❌"
+          [ "$VAL" = "success" ] && VAL_ICON="✅" || VAL_ICON="❌"
+          {
+            echo "## Validation"
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| ${FMT_ICON} \`terraform fmt\`      | \`${FMT}\` |"
+            echo "| ${VAL_ICON} \`terraform validate\` | \`${VAL}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on Format or Validate Error
+        if: steps.fmt.outcome == 'failure' || steps.validate.outcome == 'failure'
+        run: |
+          echo "::error::Format or validate failed. Run 'terraform fmt -recursive' locally and fix any errors."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Security scanning (parallel, advisory — SARIF to Security tab)
+  # ──────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # tfsec — Terraform-specific IaC analysis
+      - name: Run tfsec
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true
+          sarif_file: tfsec.sarif
+        continue-on-error: true
+
+      - name: Upload tfsec SARIF to Security tab
+        if: always() && hashFiles('tfsec.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec.sarif
+          category: tfsec
+        continue-on-error: true
+
+      # Checkov — broader IaC + misconfiguration analysis
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: Upload Checkov SARIF to Security tab
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+        continue-on-error: true
+
+      # PSScriptAnalyzer — lint the three PowerShell runbooks
+      - name: Lint PowerShell Runbooks
+        id: pssa
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $scripts = Get-ChildItem -Path . -Recurse -Filter "*.ps1" |
+            Where-Object { $_.Extension -eq ".ps1" }
+
+          $errCount = 0
+          foreach ($script in $scripts) {
+            Write-Host "Checking $($script.FullName) ..."
+            $findings = Invoke-ScriptAnalyzer -Path $script.FullName -Severity Error, Warning
+            foreach ($f in $findings) {
+              $prefix = if ($f.Severity -eq 'Error') { "::error" } else { "::warning" }
+              Write-Host "${prefix} file=$($script.Name),line=$($f.Line)::[$($f.RuleName)] $($f.Message)"
+              if ($f.Severity -eq 'Error') { $errCount++ }
+            }
+          }
+
+          if ($errCount -gt 0) {
+            Write-Host "::error::$errCount PSScriptAnalyzer error(s) found."
+            exit 1
+          }
+          Write-Host "PSScriptAnalyzer: all runbooks passed."
+        continue-on-error: true
+
+      - name: Write Security Summary
+        if: always()
+        run: |
+          TFSEC="${{ steps.tfsec.outcome }}"
+          CHECKOV="${{ steps.checkov.outcome }}"
+          PSSA="${{ steps.pssa.outcome }}"
+          {
+            echo "## Security Scan"
+            echo ""
+            echo "| Scanner | Outcome | Details |"
+            echo "|---------|---------|---------|"
+            echo "| tfsec            | \`${TFSEC}\`    | IaC misconfigurations → Security tab |"
+            echo "| Checkov          | \`${CHECKOV}\`  | IaC policy checks → Security tab     |"
+            echo "| PSScriptAnalyzer | \`${PSSA}\`     | PowerShell runbook linting            |"
+            echo ""
+            echo "> All scans are **advisory** for this lab environment."
+            echo "> View findings in the [Security tab](../../security/code-scanning)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Terraform Plan (needs validate; skipped for Destroy dispatch)
+  # ──────────────────────────────────────────────────────────────────────────
+  plan:
+    name: "Plan"
+    runs-on: ubuntu-latest
+    needs: [validate]
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.destroy != 'DESTROY'
+    outputs:
+      plan_outcome: ${{ steps.plan.outcome }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true           # required to capture plan stdout
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Cache provider plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('.terraform.lock.hcl') }}
+          restore-keys: tf-plugins-${{ runner.os }}-
+
+      - name: Configure plugin cache dir
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          echo "plugin_cache_dir = \"$HOME/.terraform.d/plugin-cache\"" >> "$HOME/.terraformrc"
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
       - name: Terraform Plan
         id: plan
-        run: terraform plan -no-color -input=false -refresh=false
+        run: terraform plan -no-color -input=false
         env:
           TF_VAR_admin_source_ip: ${{ secrets.ADMIN_SOURCE_IP }}
         continue-on-error: true
 
-      - name: Post Plan Comment on PR
-        if: ${{ github.event_name == 'pull_request' }}
+      - name: Write Plan to Job Summary
+        if: always()
+        env:
+          PLAN_OUT: ${{ steps.plan.outputs.stdout }}
+        run: |
+          OUTCOME="${{ steps.plan.outcome }}"
+          [ "$OUTCOME" = "success" ] && ICON="✅" || ICON="❌"
+          {
+            echo "## Terraform Plan — ${ICON} \`${OUTCOME}\`"
+            echo ""
+            echo '```'
+            printf '%s\n' "${PLAN_OUT:0:60000}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post / Update Plan Comment on PR
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
+          FMT_OUTCOME: ${{ needs.validate.outputs.fmt_outcome }}
+          VALIDATE_OUTCOME: ${{ needs.validate.outputs.validate_outcome }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fmt      = '${{ steps.fmt.outcome }}';
-            const validate = '${{ steps.validate.outcome }}';
+            const fmt      = process.env.FMT_OUTCOME;
+            const validate = process.env.VALIDATE_OUTCOME;
             const plan     = '${{ steps.plan.outcome }}';
+            const rawPlan  = process.env.PLAN_STDOUT || '(no output)';
 
-            const icon = (s) => s === 'success' ? 'OK' : s === 'failure' ? 'FAIL' : 'WARN';
+            const icon = (s) => s === 'success' ? '✅' : s === 'failure' ? '❌' : '⚠️';
+
+            // Parse summary line from plan output
+            const summaryMatch = rawPlan.match(/Plan: .+/);
+            const noChanges    = rawPlan.includes('No changes.');
+            const planSummary  = summaryMatch
+              ? summaryMatch[0]
+              : noChanges ? 'No changes — infrastructure matches the configuration.' : '';
+
+            // Truncate to avoid GitHub 65 536-char comment limit
+            const MAX      = 60000;
+            const planBody = rawPlan.length > MAX
+              ? rawPlan.slice(0, MAX) +
+                '\n\n… _(output truncated — see [Actions summary](' +
+                '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}' +
+                '))_'
+              : rawPlan;
 
             const body = [
               '### Terraform Plan',
               '',
               '| Step | Result |',
               '|------|--------|',
-              `| Format check | ${icon(fmt)} \`${fmt}\` |`,
-              `| Validate     | ${icon(validate)} \`${validate}\` |`,
-              `| Plan         | ${icon(plan)} \`${plan}\` |`,
+              `| ${icon(fmt)} \`terraform fmt\`      | \`${fmt}\` |`,
+              `| ${icon(validate)} \`terraform validate\` | \`${validate}\` |`,
+              `| ${icon(plan)} \`terraform plan\`     | \`${plan}\` |`,
               '',
-              '<details><summary>Full plan output (click to expand)</summary>',
+              planSummary ? `> **${planSummary}**` : '',
               '',
-              '```',
-              process.env.PLAN_STDOUT || '(no output)',
+              '<details><summary>Full plan output</summary>',
+              '',
+              '```hcl',
+              planBody,
               '```',
               '',
               '</details>',
               '',
-              `> Actor: @${{ github.actor }} | Branch: ${{ github.head_ref }} | Workflow: ${{ github.workflow }}`,
+              '---',
+              `*Triggered by @${{ github.actor }} on \`${{ github.head_ref }}\` · ` +
+              `[View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`,
             ].join('\n');
 
+            // Update existing bot comment; create if first time
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
-              repo: context.repo.repo,
+              repo:  context.repo.repo,
               issue_number: context.issue.number,
             });
-            const prev = comments.find(c =>
-              c.user.type === 'Bot' && c.body.startsWith('### Terraform Plan')
+            const prev = comments.find(
+              c => c.user.type === 'Bot' && c.body.startsWith('### Terraform Plan')
             );
             if (prev) {
-              await github.rest.issues.deleteComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
                 comment_id: prev.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
               });
             }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body,
-            });
 
-      - name: Fail on Plan Error
-        if: ${{ steps.plan.outcome == 'failure' || steps.validate.outcome == 'failure' }}
+      - name: Fail if Plan Errored
+        if: steps.plan.outcome == 'failure'
         run: |
-          echo "::error::Terraform plan or validate step failed - see output above."
+          echo "::error::terraform plan failed — see output above."
           exit 1
 
-  # ============================================================================
-  # JOB 2 - Security scan (parallel, non-blocking)
-  # ============================================================================
-  security-scan:
-    name: "Security Scan (tfsec)"
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.3
-        with:
-          soft_fail: true
-
-  # ============================================================================
-  # JOB 3 - Apply (main branch only, requires Environment approval)
-  # ============================================================================
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4 — Apply (main branch push only; requires production environment gate)
+  #          Runs when plan passes; security-scan failure is advisory only.
+  # ──────────────────────────────────────────────────────────────────────────
   apply:
     name: "Apply"
     runs-on: ubuntu-latest
     needs: [plan, security-scan]
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.plan.result == 'success'
     environment: production
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Cache provider plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('.terraform.lock.hcl') }}
+          restore-keys: tf-plugins-${{ runner.os }}-
+
+      - name: Configure plugin cache dir
+        run: |
+          mkdir -p "$HOME/.terraform.d/plugin-cache"
+          echo "plugin_cache_dir = \"$HOME/.terraform.d/plugin-cache\"" >> "$HOME/.terraformrc"
 
       - name: Azure OIDC Login
         uses: azure/login@v2
@@ -172,28 +415,39 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
 
       - name: Terraform Init
         run: terraform init -input=false
 
       - name: Terraform Apply
+        id: apply
         run: terraform apply -auto-approve -input=false
         env:
           TF_VAR_admin_source_ip: ${{ secrets.ADMIN_SOURCE_IP }}
 
-  # ============================================================================
-  # JOB 4 - Destroy (manual workflow_dispatch only, double-confirmed by input)
-  # ============================================================================
+      - name: Write Apply Summary
+        if: always()
+        run: |
+          OUTCOME="${{ steps.apply.outcome }}"
+          [ "$OUTCOME" = "success" ] && ICON="✅" || ICON="❌"
+          {
+            echo "## Apply — ${ICON} \`${OUTCOME}\`"
+            echo ""
+            echo "| Field  | Value |"
+            echo "|--------|-------|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Actor  | @${{ github.actor }} |"
+            echo "| Time   | $(date -u '+%Y-%m-%d %H:%M UTC') |"
+            echo "| Run    | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 5 — Destroy (manual workflow_dispatch only, double-confirmed)
+  # ──────────────────────────────────────────────────────────────────────────
   destroy:
     name: "Destroy (manual only)"
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.destroy == 'DESTROY' }}
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.destroy == 'DESTROY'
     environment: production
 
     steps:
@@ -211,6 +465,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
 
       - name: Terraform Init
@@ -220,3 +475,17 @@ jobs:
         run: terraform destroy -auto-approve -input=false
         env:
           TF_VAR_admin_source_ip: ${{ secrets.ADMIN_SOURCE_IP }}
+
+      - name: Write Destroy Summary
+        if: always()
+        run: |
+          {
+            echo "## ⚠️ Destroy"
+            echo ""
+            echo "All resources in workspace \`avd-fslogix-autogrow-lab\` have been destroyed."
+            echo ""
+            echo "| Field  | Value |"
+            echo "|--------|-------|"
+            echo "| Actor  | @${{ github.actor }} |"
+            echo "| Time   | $(date -u '+%Y-%m-%d %H:%M UTC') |"
+          } >> "$GITHUB_STEP_SUMMARY"
