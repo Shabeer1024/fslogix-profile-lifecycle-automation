@@ -57,7 +57,7 @@ resource "azurerm_virtual_machine_extension" "domain_join" {
     Name    = var.domain_name
     User    = var.domain_admin_user
     Restart = "true"
-    Options = "3"  # JOIN_DOMAIN + ACCT_CREATE
+    Options = "3" # JOIN_DOMAIN + ACCT_CREATE
   })
 
   protected_settings = jsonencode({
@@ -84,8 +84,8 @@ resource "azurerm_virtual_machine_extension" "avd_dsc" {
     modulesUrl            = var.avd_dsc_config_url
     configurationFunction = "Configuration.ps1\\AddSessionHost"
     properties = {
-      hostPoolName          = var.host_pool_name
-      aadJoin               = false
+      hostPoolName = var.host_pool_name
+      aadJoin      = false
     }
   })
 

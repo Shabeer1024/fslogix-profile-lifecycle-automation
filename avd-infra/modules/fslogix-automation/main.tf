@@ -40,7 +40,7 @@ resource "azurerm_virtual_machine_run_command" "install_hyperv" {
   virtual_machine_id = var.session_host_vm_id
   location           = var.location
 
- source {
+  source {
     script = <<-EOT
       $ErrorActionPreference = "Stop"
       try {
@@ -105,7 +105,7 @@ resource "azurerm_automation_webhook" "fslogix_autogrow_trigger" {
   enabled                 = true
   runbook_name            = azurerm_automation_runbook.fslogix_autogrow.name
 
-  run_on_worker_group     = azurerm_automation_hybrid_runbook_worker_group.this.name
+  run_on_worker_group = azurerm_automation_hybrid_runbook_worker_group.this.name
 
   lifecycle {
     ignore_changes = [expiry_time]

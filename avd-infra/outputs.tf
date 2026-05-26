@@ -52,8 +52,8 @@ output "session_host_private_ip" {
 }
 
 output "fslogix_storage_account" { value = module.fslogix_storage.storage_account_name }
-output "fslogix_share_unc"       { value = module.fslogix_storage.share_unc }
-output "fslogix_share_quota_gb"  { value = module.fslogix_storage.share_quota_gb }
+output "fslogix_share_unc" { value = module.fslogix_storage.share_unc }
+output "fslogix_share_quota_gb" { value = module.fslogix_storage.share_quota_gb }
 # =============================================================================
 # Phase 2 - Hybrid Worker
 # =============================================================================

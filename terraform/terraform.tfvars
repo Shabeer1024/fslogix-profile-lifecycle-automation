@@ -15,14 +15,14 @@ file_share_name             = "profiles"
 file_share_quota_gb         = 1024
 
 # Network
-enable_private_endpoint     = false
-allowed_ip_ranges           = []
+enable_private_endpoint = false
+allowed_ip_ranges       = []
 
 # AVD
-avd_resource_group          = "AVD-image-Lab"
-host_pool_name              = "avd-lab-hostpool"
-session_host_principal_ids  = []
+avd_resource_group         = "AVD-image-Lab"
+host_pool_name             = "avd-lab-hostpool"
+session_host_principal_ids = []
 
 # General
-environment                 = "lab"
-subscription_id             = "your-subscription-id"
+environment     = "lab"
+subscription_id = "your-subscription-id"

@@ -47,7 +47,7 @@ resource "azurerm_storage_share" "fslogix_profiles" {
   quota              = var.file_share_quota_gb
 
   metadata = {
-    purpose = "fslogix-user-profiles"
+    purpose       = "fslogix-user-profiles"
     migrated-from = var.source_storage_account_name
   }
 }

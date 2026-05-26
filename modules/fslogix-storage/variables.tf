@@ -16,7 +16,7 @@ variable "fslogix_initial_size_mb" {
   type    = number
   default = 10240
 }
-variable "session_host_vm_id"   { type = string }
+variable "session_host_vm_id" { type = string }
 variable "session_host_vm_name" { type = string }
 variable "tags" {
   type    = map(string)
